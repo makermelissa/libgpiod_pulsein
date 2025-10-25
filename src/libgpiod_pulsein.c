@@ -46,13 +46,13 @@ unsigned int pulses[MAX_PULSE_BUFFER] = {0};
 // Accessed by multiple threads with explicit synchronization
 cbuf_handle_t ringbuffer;
 pthread_mutex_t ringbuffer_mtx;
-struct gpiod_line *line;
+struct gpiod_line_request *line_request;
 pthread_mutex_t line_mtx;
 volatile bool was_paused = false;
 pthread_mutex_t barrier;
 
 #if defined(FOLLOW_PULSE)
-struct gpiod_line *line2;
+struct gpiod_line_request *line_request2;
 #endif
 
 int offset;
@@ -75,6 +75,122 @@ static const struct option longopts[] = {
 };
 
 static const char *const shortopts = "+hviptd";
+
+static struct gpiod_line_request *request_input_line(const char *chip_path, unsigned int offset) {
+	struct gpiod_request_config *req_cfg = NULL;
+	struct gpiod_line_request *request = NULL;
+	struct gpiod_line_settings *settings;
+	struct gpiod_line_config *line_cfg;
+	struct gpiod_chip *chip;
+	int ret;
+
+	chip = gpiod_chip_open(chip_path);
+	if (!chip)
+		return NULL;
+
+	settings = gpiod_line_settings_new();
+	if (!settings)
+		goto close_chip;
+
+	gpiod_line_settings_set_direction(settings, GPIOD_LINE_DIRECTION_INPUT);
+
+	line_cfg = gpiod_line_config_new();
+	if (!line_cfg)
+		goto free_settings;
+
+	ret = gpiod_line_config_add_line_settings(line_cfg, &offset, 1,
+						  settings);
+	if (ret)
+		goto free_line_config;
+
+	if (consumername) {
+		req_cfg = gpiod_request_config_new();
+		if (!req_cfg)
+			goto free_line_config;
+
+		gpiod_request_config_set_consumer(req_cfg, consumername);
+	}
+
+	request = gpiod_chip_request_lines(chip, req_cfg, line_cfg);
+
+	gpiod_request_config_free(req_cfg);
+
+free_line_config:
+	gpiod_line_config_free(line_cfg);
+
+free_settings:
+	gpiod_line_settings_free(settings);
+
+close_chip:
+	gpiod_chip_close(chip);
+
+	return request;
+}
+
+static int reconfigure_line_request_output(struct gpiod_line_request *request,
+				      unsigned int offset,
+				      enum gpiod_line_value default_value) {
+	struct gpiod_line_settings *settings;
+	struct gpiod_line_config *line_cfg;
+	int ret = -1;
+
+	settings = gpiod_line_settings_new();
+	if (!settings)
+		return -1;
+
+	gpiod_line_settings_set_direction(settings, GPIOD_LINE_DIRECTION_OUTPUT);
+	gpiod_line_settings_set_output_value(settings, default_value);
+
+	line_cfg = gpiod_line_config_new();
+	if (!line_cfg)
+		goto free_settings;
+
+	ret = gpiod_line_config_add_line_settings(line_cfg, &offset, 1,
+						  settings);
+	if (ret)
+		goto free_line_config;
+
+	ret = gpiod_line_request_reconfigure_lines(request, line_cfg);
+
+free_line_config:
+	gpiod_line_config_free(line_cfg);
+
+free_settings:
+	gpiod_line_settings_free(settings);
+
+	return ret;
+}
+
+static int reconfigure_line_request_input(struct gpiod_line_request *request, unsigned int offset) {
+	struct gpiod_line_settings *settings;
+	struct gpiod_line_config *line_cfg;
+	int ret = -1;
+
+	settings = gpiod_line_settings_new();
+	if (!settings)
+		return -1;
+
+	gpiod_line_settings_set_direction(settings, GPIOD_LINE_DIRECTION_INPUT);
+
+	line_cfg = gpiod_line_config_new();
+	if (!line_cfg)
+		goto free_settings;
+
+	ret = gpiod_line_config_add_line_settings(line_cfg, &offset, 1,
+						  settings);
+	if (ret)
+		goto free_line_config;
+
+	ret = gpiod_line_request_reconfigure_lines(request, line_cfg);
+
+free_line_config:
+	gpiod_line_config_free(line_cfg);
+
+free_settings:
+	gpiod_line_settings_free(settings);
+
+	return ret;
+}
 
 static void print_help(void) {
   printf("Usage: libgpiod_pulsein [OPTIONS] <chip name/number> <offset>\n");
@@ -188,13 +304,15 @@ int main(int argc, char **argv) {
   // to make process more 'real time'.
   set_max_priority();
 
-  chip = gpiod_chip_open_by_name(device);
+  chip = gpiod_chip_open(device);
   if (!chip) {
     printf("Unable to open chip: %s\n", device);
     exit(1);
   }
-  line = gpiod_chip_get_line(chip, offset);
-  if (!line) {
+
+  line_request = request_input_line(device, offset);
+
+  if (!line_request) {
     printf("Unable to open line: %d\n", offset);
     exit(1);
   }
@@ -218,31 +336,33 @@ int main(int argc, char **argv) {
   }
 
   if (!fast_linux && us_per_tick == 0) {
-    us_per_tick = calculate_us_per_tick(line);
+    us_per_tick = calculate_us_per_tick(line_request);
   }
 
 #if defined(FOLLOW_PULSE)
   // Helpful for debugging where we do our reads on a scope
-  line2 = gpiod_chip_get_line(chip, FOLLOW_PULSE);
-  if (!line2) {
+
+  line_request2 = request_input_line(device, FOLLOW_PULSE);
+
+  if (!line_request2) {
     printf("Unable to open line: %d\n", FOLLOW_PULSE);
     exit(1);
   }
-  gpiod_line_release(line2);
-  if (gpiod_line_request_output(line2, consumername, 0) != 0) {
+
+  if (reconfigure_line(line_request2, FOLLOW_PULSE, GPIOD_LINE_DIRECTION_OUTPUT, GPIOD_LINE_VALUE_INACTIVE) != 0) {
     printf("Unable to set line %d to output\n", FOLLOW_PULSE);
     exit(1);
   }
 #endif
 
   // set to an input
-  if (gpiod_line_request_input(line, consumername) != 0) {
+  if (reconfigure_line_request_input(line_request, offset) != 0) {
     printf("Unable to set line %d to input\n", offset);
     exit(1);
   }
 
   if (trigger_pulse) {
-    pulse_output(line, idle_state, trigger_len_us);
+    pulse_output(line_request, idle_state, trigger_len_us);
   }
 
   // a simple ring buffer
@@ -314,7 +434,7 @@ int main(int argc, char **argv) {
             busy_wait_milliseconds(80);
             while (pthread_mutex_trylock(&line_mtx) != 0)
               ;
-            pulse_output(line, idle_state, trigger_len);
+            pulse_output(line_request, idle_state, trigger_len);
             pthread_mutex_unlock(&line_mtx);
           }
         } else if (cmd == '^') {
@@ -395,46 +515,46 @@ void set_max_priority(void) {
 }
 
 // not thread-safe, expects exclusive access to line
-void pulse_output(struct gpiod_line *line, bool idle_state,
+void pulse_output(struct gpiod_line_request *line_request, bool idle_state,
                   int trigger_len_us) {
   // printf("Triggering output for %d microseconds\n", trigger_len_us);
-  gpiod_line_release(line);
+  gpiod_line_request_release(line_request);
   // set to an output
-  if (gpiod_line_request_output(line, consumername, idle_state) != 0) {
+  if (reconfigure_line_request_output(line_request, offset, idle_state) != 0) {
     printf("Unable to set line to output\n");
     exit(1);
   }
   // set 'active'
-  if (gpiod_line_set_value(line, !idle_state) != 0) {
+  if (gpiod_line_request_set_value(line_request, offset, !idle_state) != 0) {
     printf("Unable to set line for trigger pulse\n");
     exit(1);
   }
   // wait
   busy_wait_milliseconds(trigger_len_us / 1000);
   // set back to idle
-  if (gpiod_line_set_value(line, idle_state) != 0) {
+  if (gpiod_line_request_set_value(line_request, offset, idle_state) != 0) {
     printf("Unable to set line for trigger pulse\n");
     exit(1);
   }
 
   // release for input usage
-  gpiod_line_release(line);
+  gpiod_line_request_release(line_request);
 
   // set back to an input
-  if (gpiod_line_request_input(line, consumername) != 0) {
+  if (reconfigure_line_request_input(line_request, offset) != 0) {
     printf("Unable to set line to input\n");
     exit(1);
   }
 }
 
 // not thread-safe, expects exclusive access to line
-float calculate_us_per_tick(struct gpiod_line *line) {
+float calculate_us_per_tick(struct gpiod_line_request *line_request) {
   struct timeval time_event;
   double previous_time, current_time;
   // self calibrate best we can
   // printf("Calculating us per tick\n");
 
-  if (gpiod_line_request_input(line, consumername) != 0) {
+  if (reconfigure_line_request_input(line_request, offset) != 0) {
     printf("Unable to set line to input\n");
     exit(1);
   }
@@ -445,7 +565,7 @@ float calculate_us_per_tick(struct gpiod_line *line) {
   previous_time += time_event.tv_usec;
 
   for (int i = 0; i < 100; i++) {
-    int ret = gpiod_line_get_value(line);
+    int ret = gpiod_line_request_get_value(line_request, offset);
     if (ret == -1) {
       printf("Unable to read line during calibration\n");
       exit(1);
@@ -458,7 +578,7 @@ float calculate_us_per_tick(struct gpiod_line *line) {
   float us_per_tick = (current_time - previous_time) / 100;
   // printf("us_per_tick: %f\n", us_per_tick);
   // Be kind, rewind!
-  gpiod_line_release(line);
+  gpiod_line_request_release(line_request);
   return us_per_tick;
 }
 
@@ -505,7 +625,7 @@ void *polling_thread_runner(void *args) {
     // spin lock in order to keep the CPU awake and clocked high
     while (pthread_mutex_trylock(&line_mtx) != 0)
       ;
-    value = gpiod_line_get_value(line);
+    value = gpiod_line_request_get_value(line_request, offset);
     pthread_mutex_unlock(&line_mtx);
     if (value < 0) {
       printf("Unable to read line %d\n", offset);
@@ -539,7 +659,7 @@ void *polling_thread_runner(void *args) {
     }
 
 #if defined(FOLLOW_PULSE)
-    if (gpiod_line_set_value(line2, value) != 0) {
+    if (gpiod_line_request_set_value(line_request2, FOLLOW_PULSE, value) != 0) {
       printf("Unable to set line %d to active level\n", FOLLOW_PULSE);
       exit(1);
     }
